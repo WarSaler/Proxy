@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Устанавливаем зависимости
-RUN npm ci --only=production
+RUN npm install --only=production
 
 # Копируем исходный код
 COPY . .
@@ -25,4 +25,4 @@ USER proxy
 EXPOSE 3000 1080
 
 # Команда запуска
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
