@@ -7,6 +7,7 @@ const axios = require('axios');
 const winston = require('winston');
 const helmet = require('helmet');
 const cors = require('cors');
+const WebSocket = require('ws');
 
 // Настройка логирования
 const logger = winston.createLogger({
@@ -421,71 +422,76 @@ class SOCKS5Server {
 // Создаем отдельный TCP сервер для SOCKS5 на том же порту
 let socksServer = new SOCKS5Server(SOCKS_PORT);
 
-if (SOCKS_PORT === PORT) {
-  // На Render используем один порт для HTTP и SOCKS5
-  logger.info('Setting up unified port for HTTP and SOCKS5');
+// Создаем WebSocket сервер для SOCKS5 через HTTP
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws, req) => {
+  logger.info('WebSocket SOCKS5 connection established');
   
-  // Создаем raw TCP сервер для обработки всех соединений
-  const rawServer = net.createServer((socket) => {
-    logger.info('New raw connection received');
-    
-    socket.once('data', (data) => {
-      logger.info(`Raw data received: ${data.toString('hex').substring(0, 20)}...`);
+  ws.on('message', (data) => {
+    try {
+      // Обрабатываем SOCKS5 данные через WebSocket
+      const buffer = Buffer.from(data);
+      logger.info(`WebSocket SOCKS5 data: ${buffer.toString('hex').substring(0, 20)}...`);
       
-      // Проверяем первые байты для определения протокола
-      const firstByte = data[0];
-      const dataStr = data.toString('ascii', 0, Math.min(data.length, 10));
-      
-      if (dataStr.startsWith('GET ') || dataStr.startsWith('POST ') || dataStr.startsWith('HEAD ') || 
-          dataStr.startsWith('PUT ') || dataStr.startsWith('DELETE ') || dataStr.startsWith('OPTIONS ') ||
-          dataStr.startsWith('PATCH ')) {
-        // HTTP запрос - создаем новое соединение к HTTP серверу
-        logger.info('HTTP request detected, forwarding to HTTP server');
+      if (buffer[0] === 5) {
+        // Создаем виртуальный сокет для обработки SOCKS5
+        const virtualSocket = {
+          write: (data) => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(data);
+            }
+          },
+          destroy: () => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.close();
+            }
+          },
+          socksState: 'init',
+          setTimeout: () => {},
+          on: () => {},
+          removeAllListeners: () => {}
+        };
         
-        const httpSocket = net.connect(PORT + 1, 'localhost', () => {
-          httpSocket.write(data);
-          socket.pipe(httpSocket);
-          httpSocket.pipe(socket);
-        });
-        
-        httpSocket.on('error', (err) => {
-          logger.error(`HTTP forward error: ${err.message}`);
-          socket.destroy();
-        });
-        
-      } else if (firstByte === 5) {
-        // SOCKS5 запрос
-        logger.info('SOCKS5 connection detected on unified port');
-        socksServer.handleConnection(socket, data);
-      } else {
-        logger.warn(`Unknown protocol on unified port. First byte: ${firstByte}, data: ${data.toString('hex')}`);
-        socket.destroy();
+        socksServer.handleConnection(virtualSocket, buffer);
       }
-    });
-    
-    socket.on('error', (err) => {
-      logger.error(`Raw socket error: ${err.message}`);
-    });
+    } catch (err) {
+      logger.error(`WebSocket SOCKS5 error: ${err.message}`);
+      ws.close();
+    }
   });
   
-  // Запускаем raw сервер на основном порту
-  rawServer.listen(PORT, () => {
-    logger.info(`Raw TCP server listening on port ${PORT}`);
+  ws.on('close', () => {
+    logger.info('WebSocket SOCKS5 connection closed');
   });
   
-  // Запускаем HTTP сервер на порту +1 для внутреннего использования
-  server.listen(PORT + 1, 'localhost', () => {
-    logger.info(`HTTP server listening on internal port ${PORT + 1}`);
+  ws.on('error', (err) => {
+    logger.error(`WebSocket SOCKS5 error: ${err.message}`);
   });
-  
-} else {
-  // Отдельные порты
+});
+
+// Добавляем маршрут для WebSocket SOCKS5 информации
+app.get('/socks5', (req, res) => {
+  res.json({
+    message: 'WebSocket SOCKS5 Proxy',
+    endpoint: `wss://${req.get('host')}/`,
+    protocol: 'WebSocket SOCKS5',
+    usage: 'Connect via WebSocket and send SOCKS5 binary data'
+  });
+});
+
+// Запускаем HTTP сервер на основном порту
+server.listen(PORT, () => {
+  logger.info(`HTTP server with WebSocket SOCKS5 listening on port ${PORT}`);
+  logger.info(`WebSocket SOCKS5 endpoint: wss://proxy-j2ht.onrender.com/`);
+});
+
+// Запускаем SOCKS5 сервер на отдельном порту (если доступен)
+if (process.env.SOCKS_PORT && process.env.SOCKS_PORT !== process.env.PORT) {
   socksServer.listen();
-  
-  // Запуск HTTP сервера
-  server.listen(PORT, () => {
-    logger.info(`HTTP server listening on port ${PORT}`);
-  });
+  logger.info(`Traditional SOCKS5 server listening on separate port ${SOCKS_PORT}`);
+} else {
+  logger.info('Traditional SOCKS5 disabled - using WebSocket SOCKS5 for Render compatibility');
 }
 
 // Keep-alive система для предотвращения засыпания на Render
