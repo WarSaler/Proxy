@@ -22,8 +22,8 @@ const logger = winston.createLogger({
 });
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-const SOCKS_PORT = process.env.SOCKS_PORT || PORT; // Use same port on Render
+const PORT = parseInt(process.env.PORT) || 10000;
+const SOCKS_PORT = parseInt(process.env.SOCKS_PORT) || PORT; // Use same port on Render
 
 // Middleware
 app.use(helmet());
