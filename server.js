@@ -140,17 +140,37 @@ class SOCKS5Server {
       stats.activeConnections++;
       stats.socksConnections++;
       
+      // Set socket state
+      socket.socksState = 'init';
+      socket.setTimeout(60000); // 60 second timeout
+      
       socket.on('data', (data) => {
-        this.handleSocksData(socket, data);
+        try {
+          this.handleSocksData(socket, data);
+        } catch (err) {
+          logger.error(`Error handling SOCKS data: ${err.message}`);
+          socket.destroy();
+        }
       });
 
       socket.on('close', () => {
-        stats.activeConnections--;
+        if (socket.socksState !== 'tunneling') {
+          stats.activeConnections--;
+        }
+        logger.info('SOCKS5 connection closed');
       });
 
       socket.on('error', (err) => {
         logger.error(`SOCKS5 socket error: ${err.message}`);
-        stats.activeConnections--;
+        if (socket.socksState !== 'tunneling') {
+          stats.activeConnections--;
+        }
+        socket.destroy();
+      });
+
+      socket.on('timeout', () => {
+        logger.info('SOCKS5 socket timeout');
+        socket.destroy();
       });
     });
   }
@@ -159,34 +179,84 @@ class SOCKS5Server {
     if (data.length < 2) return;
 
     const version = data[0];
-    if (version === 5) {
-      if (data[1] === 1 && data.length >= 3) {
-        // Authentication request
-        socket.write(Buffer.from([5, 0])); // No authentication required
-      } else if (data[1] === 1 && data.length > 3) {
-        // Connection request
-        const cmd = data[1];
-        const atyp = data[3];
-        
-        if (cmd === 1) { // CONNECT command
-          let hostname, port;
-          let offset = 4;
+    if (version !== 5) {
+      logger.error('Unsupported SOCKS version');
+      socket.destroy();
+      return;
+    }
 
-          if (atyp === 1) { // IPv4
-            hostname = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
-            port = data.readUInt16BE(8);
-          } else if (atyp === 3) { // Domain name
-            const domainLength = data[4];
-            hostname = data.slice(5, 5 + domainLength).toString();
-            port = data.readUInt16BE(5 + domainLength);
-          }
-
-          if (hostname && port) {
-            this.connectToTarget(socket, hostname, port);
-          }
+    // Handle authentication phase
+    if (socket.socksState === 'init') {
+      if (data.length >= 3) {
+        const nmethods = data[1];
+        if (data.length >= 2 + nmethods) {
+          // Send "no authentication required" response
+          socket.write(Buffer.from([5, 0]));
+          socket.socksState = 'auth_done';
+          logger.info('SOCKS5 authentication completed');
+          return;
         }
       }
+      return;
     }
+    
+    // Handle connection request phase
+    if (socket.socksState === 'auth_done') {
+      if (data.length >= 4) {
+        const cmd = data[1];
+        const rsv = data[2];
+        const atyp = data[3];
+        
+        if (cmd !== 1) {
+          // Command not supported
+          const response = Buffer.from([5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+          socket.write(response);
+          socket.destroy();
+          return;
+        }
+        
+        let hostname, port;
+
+        if (atyp === 1) { // IPv4
+          if (data.length >= 10) {
+            hostname = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
+            port = data.readUInt16BE(8);
+          }
+        } else if (atyp === 3) { // Domain name
+          if (data.length >= 5) {
+            const domainLength = data[4];
+            if (data.length >= 5 + domainLength + 2) {
+              hostname = data.slice(5, 5 + domainLength).toString();
+              port = data.readUInt16BE(5 + domainLength);
+            }
+          }
+        } else if (atyp === 4) { // IPv6
+          if (data.length >= 22) {
+            const ipv6Parts = [];
+            for (let i = 0; i < 16; i += 2) {
+              ipv6Parts.push(data.readUInt16BE(4 + i).toString(16));
+            }
+            hostname = ipv6Parts.join(':');
+            port = data.readUInt16BE(20);
+          }
+        }
+
+        if (hostname && port) {
+          socket.socksState = 'connecting';
+          logger.info(`SOCKS5 connection request to ${hostname}:${port}`);
+          this.connectToTarget(socket, hostname, port);
+        } else {
+          logger.error('Invalid SOCKS5 connection request');
+          const response = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+          socket.write(response);
+          socket.destroy();
+        }
+      }
+      return;
+    }
+    
+    // If we reach here, the socket is in an unexpected state
+    logger.error(`Unexpected SOCKS5 data in state: ${socket.socksState}`);
   }
 
   connectToTarget(clientSocket, hostname, port) {
@@ -199,26 +269,82 @@ class SOCKS5Server {
         0, 0, 0, 0, // IP address (0.0.0.0)
         0, 0 // Port (0)
       ]);
-      clientSocket.write(response);
       
-      // Pipe data between client and target
-      targetSocket.pipe(clientSocket);
-      clientSocket.pipe(targetSocket);
+      try {
+        clientSocket.write(response);
+        
+        // Set socket state to tunneling
+        clientSocket.socksState = 'tunneling';
+        
+        // Remove all previous listeners to avoid conflicts
+        clientSocket.removeAllListeners('data');
+        
+        // Pipe data between client and target
+        targetSocket.pipe(clientSocket, { end: false });
+        clientSocket.pipe(targetSocket, { end: false });
+        
+        logger.info(`SOCKS5 tunnel established to ${hostname}:${port}`);
+      } catch (err) {
+        logger.error(`Error establishing tunnel: ${err.message}`);
+        targetSocket.destroy();
+        clientSocket.destroy();
+      }
     });
 
     targetSocket.on('error', (err) => {
-      logger.error(`Target socket error: ${err.message}`);
-      const response = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]); // Connection refused
-      clientSocket.write(response);
-      clientSocket.end();
+      logger.error(`Target socket error for ${hostname}:${port}: ${err.message}`);
+      try {
+        const response = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]); // Connection refused
+        if (!clientSocket.destroyed) {
+          clientSocket.write(response);
+          clientSocket.end();
+        }
+      } catch (writeErr) {
+        logger.error(`Error writing error response: ${writeErr.message}`);
+        clientSocket.destroy();
+      }
     });
 
     clientSocket.on('close', () => {
-      targetSocket.end();
+      if (!targetSocket.destroyed) {
+        targetSocket.destroy();
+      }
+      stats.activeConnections--;
+      logger.info(`SOCKS5 client disconnected from ${hostname}:${port}`);
     });
 
     targetSocket.on('close', () => {
-      clientSocket.end();
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+      logger.info(`SOCKS5 target disconnected from ${hostname}:${port}`);
+    });
+
+    clientSocket.on('error', (err) => {
+      logger.error(`Client socket error: ${err.message}`);
+      if (!targetSocket.destroyed) {
+        targetSocket.destroy();
+      }
+      stats.activeConnections--;
+    });
+
+    // Set timeout for connection
+    const connectionTimeout = setTimeout(() => {
+      logger.error(`Connection timeout to ${hostname}:${port}`);
+      targetSocket.destroy();
+      if (!clientSocket.destroyed) {
+        const response = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        try {
+          clientSocket.write(response);
+          clientSocket.end();
+        } catch (err) {
+          clientSocket.destroy();
+        }
+      }
+    }, 30000); // 30 second timeout
+
+    targetSocket.on('connect', () => {
+      clearTimeout(connectionTimeout);
     });
   }
 
