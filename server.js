@@ -8,6 +8,7 @@ const winston = require('winston');
 const helmet = require('helmet');
 const cors = require('cors');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 // Настройка логирования
 const logger = winston.createLogger({
@@ -422,131 +423,131 @@ class SOCKS5Server {
 // Создаем отдельный TCP сервер для SOCKS5 на том же порту
 let socksServer = new SOCKS5Server(SOCKS_PORT);
 
-// HTTP SOCKS5 туннель - эмулируем SOCKS5 через HTTP
-app.use('/socks5-tunnel', (req, res) => {
-  logger.info('SOCKS5 HTTP tunnel request received');
+// MTProto прокси для Telegram через HTTP
+
+// Генерируем секретный ключ для MTProto
+const MTPROTO_SECRET = process.env.MTPROTO_SECRET || crypto.randomBytes(16).toString('hex');
+logger.info(`MTProto secret: ${MTPROTO_SECRET}`);
+
+// MTProto прокси endpoint
+app.get('/proxy', (req, res) => {
+  logger.info('MTProto proxy request received');
   
   // Устанавливаем заголовки для бинарного потока
   res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   
-  let isHandshakeComplete = false;
-  let targetSocket = null;
+  // Создаем соединение с Telegram сервером
+  const telegramServers = [
+    '149.154.175.50:443',
+    '149.154.167.51:443', 
+    '149.154.175.100:443',
+    '149.154.167.91:443',
+    '91.108.56.130:443'
+  ];
   
-  // Обрабатываем входящие данные от клиента
-  req.on('data', (data) => {
-    try {
-      logger.info(`SOCKS5 tunnel data: ${data.toString('hex').substring(0, 20)}...`);
-      
-      if (!isHandshakeComplete && data[0] === 5) {
-        // SOCKS5 handshake
-        if (data.length >= 3 && data[1] === 1 && data[2] === 0) {
-          // Отвечаем: версия 5, метод 0 (без аутентификации)
-          res.write(Buffer.from([5, 0]));
-          logger.info('SOCKS5 handshake completed');
-          return;
-        }
-        
-        // SOCKS5 connect request
-        if (data.length >= 10 && data[1] === 1) {
-          const addrType = data[3];
-          let hostname, port, offset;
-          
-          if (addrType === 1) {
-            // IPv4
-            hostname = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
-            port = (data[8] << 8) | data[9];
-            offset = 10;
-          } else if (addrType === 3) {
-            // Domain name
-            const domainLen = data[4];
-            hostname = data.slice(5, 5 + domainLen).toString();
-            port = (data[5 + domainLen] << 8) | data[6 + domainLen];
-            offset = 7 + domainLen;
-          }
-          
-          logger.info(`SOCKS5 connecting to ${hostname}:${port}`);
-          
-          // Создаем соединение с целевым сервером
-          targetSocket = net.connect(port, hostname, () => {
-            // Отправляем успешный ответ SOCKS5
-            const response = Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-            res.write(response);
-            isHandshakeComplete = true;
-            logger.info(`SOCKS5 tunnel established to ${hostname}:${port}`);
-            
-            // Пересылаем данные между клиентом и сервером
-            targetSocket.on('data', (serverData) => {
-              res.write(serverData);
-            });
-            
-            targetSocket.on('close', () => {
-              logger.info('Target connection closed');
-              res.end();
-            });
-            
-            targetSocket.on('error', (err) => {
-              logger.error(`Target connection error: ${err.message}`);
-              res.end();
-            });
-          });
-          
-          targetSocket.on('error', (err) => {
-            logger.error(`Failed to connect to ${hostname}:${port}: ${err.message}`);
-            const errorResponse = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
-            res.write(errorResponse);
-            res.end();
-          });
-        }
-      } else if (isHandshakeComplete && targetSocket) {
-        // Пересылаем данные на целевой сервер
-        targetSocket.write(data);
-      }
-    } catch (err) {
-      logger.error(`SOCKS5 tunnel error: ${err.message}`);
+  const server = telegramServers[Math.floor(Math.random() * telegramServers.length)];
+  const [host, port] = server.split(':');
+  
+  logger.info(`Connecting to Telegram server: ${host}:${port}`);
+  
+  const telegramSocket = net.connect(parseInt(port), host, () => {
+    logger.info(`Connected to Telegram server ${host}:${port}`);
+    
+    // Пересылаем данные от Telegram к клиенту
+    telegramSocket.on('data', (data) => {
+      res.write(data);
+    });
+    
+    telegramSocket.on('close', () => {
+      logger.info('Telegram connection closed');
       res.end();
+    });
+    
+    telegramSocket.on('error', (err) => {
+      logger.error(`Telegram connection error: ${err.message}`);
+      res.end();
+    });
+  });
+  
+  telegramSocket.on('error', (err) => {
+    logger.error(`Failed to connect to Telegram: ${err.message}`);
+    res.status(502).end();
+  });
+  
+  // Пересылаем данные от клиента к Telegram
+  req.on('data', (data) => {
+    if (telegramSocket && !telegramSocket.destroyed) {
+      telegramSocket.write(data);
     }
   });
   
   req.on('close', () => {
-    logger.info('SOCKS5 tunnel client disconnected');
-    if (targetSocket) {
-      targetSocket.destroy();
+    logger.info('MTProto client disconnected');
+    if (telegramSocket) {
+      telegramSocket.destroy();
     }
   });
   
   req.on('error', (err) => {
-    logger.error(`SOCKS5 tunnel request error: ${err.message}`);
-    if (targetSocket) {
-      targetSocket.destroy();
+    logger.error(`MTProto request error: ${err.message}`);
+    if (telegramSocket) {
+      telegramSocket.destroy();
     }
   });
 });
 
-// Информация о SOCKS5 туннеле
+// MTProto конфигурация для Telegram
+app.get('/mtproto-config', (req, res) => {
+  const host = req.get('host');
+  const config = {
+    server: host,
+    port: 443,
+    secret: MTPROTO_SECRET,
+    url: `https://${host}/proxy`,
+    telegram_link: `https://t.me/proxy?server=${host}&port=443&secret=${MTPROTO_SECRET}`,
+    instructions: {
+      ru: 'Откройте ссылку telegram_link в Telegram или настройте MTProto прокси вручную',
+      en: 'Open telegram_link in Telegram or configure MTProto proxy manually'
+    }
+  };
+  
+  res.json(config);
+});
+
+// Информация о прокси
 app.get('/socks5', (req, res) => {
+  const host = req.get('host');
   res.json({
-    message: 'HTTP SOCKS5 Tunnel Proxy',
-    endpoint: `https://${req.get('host')}/socks5-tunnel`,
-    protocol: 'SOCKS5 over HTTP',
-    usage: 'Configure as HTTP proxy with CONNECT method support',
-    telegram_settings: {
-      type: 'HTTP',
-      server: req.get('host'),
+    message: 'MTProto Proxy for Telegram',
+    mtproto_endpoint: `https://${host}/proxy`,
+    config_endpoint: `https://${host}/mtproto-config`,
+    protocol: 'MTProto over HTTP',
+    telegram_link: `https://t.me/proxy?server=${host}&port=443&secret=${MTPROTO_SECRET}`,
+    manual_settings: {
+      type: 'MTProto',
+      server: host,
       port: 443,
-      note: 'Use HTTPS proxy settings in Telegram'
+      secret: MTPROTO_SECRET,
+      note: 'Use MTProto proxy settings in Telegram'
+    },
+    instructions: {
+      ru: 'Откройте telegram_link в Telegram или настройте MTProto прокси вручную',
+      en: 'Open telegram_link in Telegram or configure MTProto proxy manually'
     }
   });
 });
 
 // Запускаем HTTP сервер на основном порту
 server.listen(PORT, () => {
-  logger.info(`HTTP server with SOCKS5 tunnel listening on port ${PORT}`);
-  logger.info(`SOCKS5 tunnel endpoint: https://proxy-j2ht.onrender.com/socks5-tunnel`);
+  logger.info(`HTTP server with MTProto proxy listening on port ${PORT}`);
+  logger.info(`MTProto endpoint: https://proxy-j2ht.onrender.com/proxy`);
+  logger.info(`MTProto config: https://proxy-j2ht.onrender.com/mtproto-config`);
+  logger.info(`Telegram link: https://t.me/proxy?server=proxy-j2ht.onrender.com&port=443&secret=${MTPROTO_SECRET}`);
   logger.info(`Universal Messenger Proxy started`);
   logger.info(`HTTP CONNECT proxy listening on port ${PORT}`);
-  logger.info(`SOCKS5 over HTTP tunnel available at /socks5-tunnel`);
+  logger.info(`MTProto proxy available at /proxy`);
   logger.info(`Health check available at /health`);
   
   if (process.env.RENDER_EXTERNAL_URL) {
@@ -559,7 +560,7 @@ if (process.env.SOCKS_PORT && process.env.SOCKS_PORT !== process.env.PORT) {
   socksServer.listen();
   logger.info(`Traditional SOCKS5 server listening on separate port ${SOCKS_PORT}`);
 } else {
-  logger.info('Traditional SOCKS5 disabled - using HTTP SOCKS5 tunnel for Render compatibility');
+  logger.info('Traditional SOCKS5 disabled - using MTProto proxy for Render compatibility');
 }
 
 // Keep-alive система для предотвращения засыпания на Render
