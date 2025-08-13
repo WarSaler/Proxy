@@ -418,24 +418,41 @@ class SOCKS5Server {
   }
 }
 
-// Запуск SOCKS5 сервера
+// Создаем отдельный TCP сервер для SOCKS5 на том же порту
 let socksServer = new SOCKS5Server(SOCKS_PORT);
 
 if (SOCKS_PORT === PORT) {
   // На Render используем один порт для HTTP и SOCKS5
-  logger.info('Using unified port for HTTP and SOCKS5');
+  logger.info('Setting up unified port for HTTP and SOCKS5');
   
-  // Обработка raw TCP соединений для SOCKS5
-  server.on('connection', (socket) => {
+  // Создаем raw TCP сервер для обработки всех соединений
+  const rawServer = net.createServer((socket) => {
+    logger.info('New raw connection received');
+    
     socket.once('data', (data) => {
+      logger.info(`Raw data received: ${data.toString('hex').substring(0, 20)}...`);
+      
       // Проверяем первые байты для определения протокола
       const firstByte = data[0];
-      const dataStr = data.toString('ascii', 0, Math.min(data.length, 4));
+      const dataStr = data.toString('ascii', 0, Math.min(data.length, 10));
       
-      if (dataStr.startsWith('GET ') || dataStr.startsWith('POST ') || dataStr.startsWith('HEAD ') || dataStr.startsWith('PUT ') || dataStr.startsWith('DELETE ')) {
-        // HTTP запрос - передаем обратно в HTTP сервер
-        socket.unshift(data);
-        server.emit('connection', socket);
+      if (dataStr.startsWith('GET ') || dataStr.startsWith('POST ') || dataStr.startsWith('HEAD ') || 
+          dataStr.startsWith('PUT ') || dataStr.startsWith('DELETE ') || dataStr.startsWith('OPTIONS ') ||
+          dataStr.startsWith('PATCH ')) {
+        // HTTP запрос - создаем новое соединение к HTTP серверу
+        logger.info('HTTP request detected, forwarding to HTTP server');
+        
+        const httpSocket = net.connect(PORT + 1, 'localhost', () => {
+          httpSocket.write(data);
+          socket.pipe(httpSocket);
+          httpSocket.pipe(socket);
+        });
+        
+        httpSocket.on('error', (err) => {
+          logger.error(`HTTP forward error: ${err.message}`);
+          socket.destroy();
+        });
+        
       } else if (firstByte === 5) {
         // SOCKS5 запрос
         logger.info('SOCKS5 connection detected on unified port');
@@ -445,10 +462,30 @@ if (SOCKS_PORT === PORT) {
         socket.destroy();
       }
     });
+    
+    socket.on('error', (err) => {
+      logger.error(`Raw socket error: ${err.message}`);
+    });
   });
+  
+  // Запускаем raw сервер на основном порту
+  rawServer.listen(PORT, () => {
+    logger.info(`Raw TCP server listening on port ${PORT}`);
+  });
+  
+  // Запускаем HTTP сервер на порту +1 для внутреннего использования
+  server.listen(PORT + 1, 'localhost', () => {
+    logger.info(`HTTP server listening on internal port ${PORT + 1}`);
+  });
+  
 } else {
   // Отдельные порты
   socksServer.listen();
+  
+  // Запуск HTTP сервера
+  server.listen(PORT, () => {
+    logger.info(`HTTP server listening on port ${PORT}`);
+  });
 }
 
 // Keep-alive система для предотвращения засыпания на Render
@@ -468,8 +505,9 @@ if (process.env.RENDER_EXTERNAL_URL) {
   logger.info('Keep-alive system activated for Render');
 }
 
-// Запуск HTTP сервера
-server.listen(PORT, () => {
+// HTTP сервер запускается выше в зависимости от конфигурации портов
+if (SOCKS_PORT !== PORT) {
+  // Только если используются отдельные порты, логируем общую информацию
   logger.info(`Universal Messenger Proxy started`);
   logger.info(`HTTP CONNECT proxy listening on port ${PORT}`);
   logger.info(`SOCKS5 proxy listening on port ${SOCKS_PORT}`);
@@ -478,7 +516,7 @@ server.listen(PORT, () => {
   if (process.env.RENDER_EXTERNAL_URL) {
     logger.info(`External URL: ${process.env.RENDER_EXTERNAL_URL}`);
   }
-});
+}
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
