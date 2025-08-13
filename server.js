@@ -422,68 +422,136 @@ class SOCKS5Server {
 // Создаем отдельный TCP сервер для SOCKS5 на том же порту
 let socksServer = new SOCKS5Server(SOCKS_PORT);
 
-// Создаем WebSocket сервер для SOCKS5 через HTTP
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (ws, req) => {
-  logger.info('WebSocket SOCKS5 connection established');
+// HTTP SOCKS5 туннель - эмулируем SOCKS5 через HTTP
+app.use('/socks5-tunnel', (req, res) => {
+  logger.info('SOCKS5 HTTP tunnel request received');
   
-  ws.on('message', (data) => {
+  // Устанавливаем заголовки для бинарного потока
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.setHeader('Connection', 'keep-alive');
+  
+  let isHandshakeComplete = false;
+  let targetSocket = null;
+  
+  // Обрабатываем входящие данные от клиента
+  req.on('data', (data) => {
     try {
-      // Обрабатываем SOCKS5 данные через WebSocket
-      const buffer = Buffer.from(data);
-      logger.info(`WebSocket SOCKS5 data: ${buffer.toString('hex').substring(0, 20)}...`);
+      logger.info(`SOCKS5 tunnel data: ${data.toString('hex').substring(0, 20)}...`);
       
-      if (buffer[0] === 5) {
-        // Создаем виртуальный сокет для обработки SOCKS5
-        const virtualSocket = {
-          write: (data) => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(data);
-            }
-          },
-          destroy: () => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
-          },
-          socksState: 'init',
-          setTimeout: () => {},
-          on: () => {},
-          removeAllListeners: () => {}
-        };
+      if (!isHandshakeComplete && data[0] === 5) {
+        // SOCKS5 handshake
+        if (data.length >= 3 && data[1] === 1 && data[2] === 0) {
+          // Отвечаем: версия 5, метод 0 (без аутентификации)
+          res.write(Buffer.from([5, 0]));
+          logger.info('SOCKS5 handshake completed');
+          return;
+        }
         
-        socksServer.handleConnection(virtualSocket, buffer);
+        // SOCKS5 connect request
+        if (data.length >= 10 && data[1] === 1) {
+          const addrType = data[3];
+          let hostname, port, offset;
+          
+          if (addrType === 1) {
+            // IPv4
+            hostname = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
+            port = (data[8] << 8) | data[9];
+            offset = 10;
+          } else if (addrType === 3) {
+            // Domain name
+            const domainLen = data[4];
+            hostname = data.slice(5, 5 + domainLen).toString();
+            port = (data[5 + domainLen] << 8) | data[6 + domainLen];
+            offset = 7 + domainLen;
+          }
+          
+          logger.info(`SOCKS5 connecting to ${hostname}:${port}`);
+          
+          // Создаем соединение с целевым сервером
+          targetSocket = net.connect(port, hostname, () => {
+            // Отправляем успешный ответ SOCKS5
+            const response = Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+            res.write(response);
+            isHandshakeComplete = true;
+            logger.info(`SOCKS5 tunnel established to ${hostname}:${port}`);
+            
+            // Пересылаем данные между клиентом и сервером
+            targetSocket.on('data', (serverData) => {
+              res.write(serverData);
+            });
+            
+            targetSocket.on('close', () => {
+              logger.info('Target connection closed');
+              res.end();
+            });
+            
+            targetSocket.on('error', (err) => {
+              logger.error(`Target connection error: ${err.message}`);
+              res.end();
+            });
+          });
+          
+          targetSocket.on('error', (err) => {
+            logger.error(`Failed to connect to ${hostname}:${port}: ${err.message}`);
+            const errorResponse = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+            res.write(errorResponse);
+            res.end();
+          });
+        }
+      } else if (isHandshakeComplete && targetSocket) {
+        // Пересылаем данные на целевой сервер
+        targetSocket.write(data);
       }
     } catch (err) {
-      logger.error(`WebSocket SOCKS5 error: ${err.message}`);
-      ws.close();
+      logger.error(`SOCKS5 tunnel error: ${err.message}`);
+      res.end();
     }
   });
   
-  ws.on('close', () => {
-    logger.info('WebSocket SOCKS5 connection closed');
+  req.on('close', () => {
+    logger.info('SOCKS5 tunnel client disconnected');
+    if (targetSocket) {
+      targetSocket.destroy();
+    }
   });
   
-  ws.on('error', (err) => {
-    logger.error(`WebSocket SOCKS5 error: ${err.message}`);
+  req.on('error', (err) => {
+    logger.error(`SOCKS5 tunnel request error: ${err.message}`);
+    if (targetSocket) {
+      targetSocket.destroy();
+    }
   });
 });
 
-// Добавляем маршрут для WebSocket SOCKS5 информации
+// Информация о SOCKS5 туннеле
 app.get('/socks5', (req, res) => {
   res.json({
-    message: 'WebSocket SOCKS5 Proxy',
-    endpoint: `wss://${req.get('host')}/`,
-    protocol: 'WebSocket SOCKS5',
-    usage: 'Connect via WebSocket and send SOCKS5 binary data'
+    message: 'HTTP SOCKS5 Tunnel Proxy',
+    endpoint: `https://${req.get('host')}/socks5-tunnel`,
+    protocol: 'SOCKS5 over HTTP',
+    usage: 'Configure as HTTP proxy with CONNECT method support',
+    telegram_settings: {
+      type: 'HTTP',
+      server: req.get('host'),
+      port: 443,
+      note: 'Use HTTPS proxy settings in Telegram'
+    }
   });
 });
 
 // Запускаем HTTP сервер на основном порту
 server.listen(PORT, () => {
-  logger.info(`HTTP server with WebSocket SOCKS5 listening on port ${PORT}`);
-  logger.info(`WebSocket SOCKS5 endpoint: wss://proxy-j2ht.onrender.com/`);
+  logger.info(`HTTP server with SOCKS5 tunnel listening on port ${PORT}`);
+  logger.info(`SOCKS5 tunnel endpoint: https://proxy-j2ht.onrender.com/socks5-tunnel`);
+  logger.info(`Universal Messenger Proxy started`);
+  logger.info(`HTTP CONNECT proxy listening on port ${PORT}`);
+  logger.info(`SOCKS5 over HTTP tunnel available at /socks5-tunnel`);
+  logger.info(`Health check available at /health`);
+  
+  if (process.env.RENDER_EXTERNAL_URL) {
+    logger.info(`External URL: ${process.env.RENDER_EXTERNAL_URL}`);
+  }
 });
 
 // Запускаем SOCKS5 сервер на отдельном порту (если доступен)
@@ -491,7 +559,7 @@ if (process.env.SOCKS_PORT && process.env.SOCKS_PORT !== process.env.PORT) {
   socksServer.listen();
   logger.info(`Traditional SOCKS5 server listening on separate port ${SOCKS_PORT}`);
 } else {
-  logger.info('Traditional SOCKS5 disabled - using WebSocket SOCKS5 for Render compatibility');
+  logger.info('Traditional SOCKS5 disabled - using HTTP SOCKS5 tunnel for Render compatibility');
 }
 
 // Keep-alive система для предотвращения засыпания на Render
@@ -511,18 +579,7 @@ if (process.env.RENDER_EXTERNAL_URL) {
   logger.info('Keep-alive system activated for Render');
 }
 
-// HTTP сервер запускается выше в зависимости от конфигурации портов
-if (SOCKS_PORT !== PORT) {
-  // Только если используются отдельные порты, логируем общую информацию
-  logger.info(`Universal Messenger Proxy started`);
-  logger.info(`HTTP CONNECT proxy listening on port ${PORT}`);
-  logger.info(`SOCKS5 proxy listening on port ${SOCKS_PORT}`);
-  logger.info(`Health check available at /health`);
-  
-  if (process.env.RENDER_EXTERNAL_URL) {
-    logger.info(`External URL: ${process.env.RENDER_EXTERNAL_URL}`);
-  }
-}
+// HTTP сервер уже запущен выше с полным логированием
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
