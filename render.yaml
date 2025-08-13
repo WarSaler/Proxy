@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: universal-messenger-proxy
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: SOCKS_PORT
+        value: 1080
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: universal-messenger-proxy
+          property: host
+    buildCommand: npm ci
+    startCommand: npm start
+    disk:
+      name: proxy-disk
+      mountPath: /app/logs
+      sizeGB: 1
