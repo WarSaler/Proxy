@@ -22,8 +22,8 @@ const logger = winston.createLogger({
 });
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SOCKS_PORT = process.env.SOCKS_PORT || 1080;
+const PORT = process.env.PORT || 10000;
+const SOCKS_PORT = process.env.SOCKS_PORT || PORT; // Use same port on Render
 
 // Middleware
 app.use(helmet());
@@ -176,11 +176,25 @@ class SOCKS5Server {
   }
 
   handleSocksData(socket, data) {
-    if (data.length < 2) return;
+    if (data.length < 2) {
+      logger.warn(`Insufficient data length: ${data.length}`);
+      return;
+    }
+
+    // Check if this is HTTP request (common issue on Render)
+    const dataStr = data.toString('ascii', 0, Math.min(data.length, 10));
+    if (dataStr.startsWith('GET ') || dataStr.startsWith('POST ') || dataStr.startsWith('HEAD ')) {
+      logger.warn(`HTTP request received on SOCKS port: ${dataStr}`);
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\nThis is a SOCKS5 proxy, not HTTP');
+      socket.destroy();
+      return;
+    }
 
     const version = data[0];
+    logger.info(`Received SOCKS data: version=${version}, length=${data.length}, state=${socket.socksState}, hex=${data.toString('hex')}`);
+    
     if (version !== 5) {
-      logger.error('Unsupported SOCKS version');
+      logger.error(`Unsupported SOCKS version: ${version}, expected 5. Data: ${data.toString('hex')}`);
       socket.destroy();
       return;
     }
@@ -348,6 +362,55 @@ class SOCKS5Server {
     });
   }
 
+  handleConnection(socket, initialData) {
+    logger.info('Handling existing SOCKS5 connection');
+    stats.totalConnections++;
+    stats.activeConnections++;
+    stats.socksConnections++;
+    
+    // Set socket state
+    socket.socksState = 'init';
+    socket.setTimeout(60000);
+    
+    // Handle initial data
+    try {
+      this.handleSocksData(socket, initialData);
+    } catch (err) {
+      logger.error(`Error handling initial SOCKS data: ${err.message}`);
+      socket.destroy();
+    }
+    
+    // Set up event handlers
+    socket.on('data', (data) => {
+      try {
+        this.handleSocksData(socket, data);
+      } catch (err) {
+        logger.error(`Error handling SOCKS data: ${err.message}`);
+        socket.destroy();
+      }
+    });
+
+    socket.on('close', () => {
+      if (socket.socksState !== 'tunneling') {
+        stats.activeConnections--;
+      }
+      logger.info('SOCKS5 connection closed');
+    });
+
+    socket.on('error', (err) => {
+      logger.error(`SOCKS5 socket error: ${err.message}`);
+      if (socket.socksState !== 'tunneling') {
+        stats.activeConnections--;
+      }
+      socket.destroy();
+    });
+
+    socket.on('timeout', () => {
+      logger.info('SOCKS5 socket timeout');
+      socket.destroy();
+    });
+  }
+
   listen() {
     this.server.listen(this.port, () => {
       logger.info(`SOCKS5 server listening on port ${this.port}`);
@@ -356,8 +419,37 @@ class SOCKS5Server {
 }
 
 // Запуск SOCKS5 сервера
-const socksServer = new SOCKS5Server(SOCKS_PORT);
-socksServer.listen();
+let socksServer = new SOCKS5Server(SOCKS_PORT);
+
+if (SOCKS_PORT === PORT) {
+  // На Render используем один порт для HTTP и SOCKS5
+  logger.info('Using unified port for HTTP and SOCKS5');
+  
+  // Обработка raw TCP соединений для SOCKS5
+  server.on('connection', (socket) => {
+    socket.once('data', (data) => {
+      // Проверяем первые байты для определения протокола
+      const firstByte = data[0];
+      const dataStr = data.toString('ascii', 0, Math.min(data.length, 4));
+      
+      if (dataStr.startsWith('GET ') || dataStr.startsWith('POST ') || dataStr.startsWith('HEAD ') || dataStr.startsWith('PUT ') || dataStr.startsWith('DELETE ')) {
+        // HTTP запрос - передаем обратно в HTTP сервер
+        socket.unshift(data);
+        server.emit('connection', socket);
+      } else if (firstByte === 5) {
+        // SOCKS5 запрос
+        logger.info('SOCKS5 connection detected on unified port');
+        socksServer.handleConnection(socket, data);
+      } else {
+        logger.warn(`Unknown protocol on unified port. First byte: ${firstByte}, data: ${data.toString('hex')}`);
+        socket.destroy();
+      }
+    });
+  });
+} else {
+  // Отдельные порты
+  socksServer.listen();
+}
 
 // Keep-alive система для предотвращения засыпания на Render
 if (process.env.RENDER_EXTERNAL_URL) {
